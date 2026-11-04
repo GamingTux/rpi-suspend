@@ -614,7 +614,7 @@ def mute_audio():
 
 
 def restore_audio(cfg, saved_audio_state):
-    """Restores audio HID interface, runtime autosuspend delay (2000ms), and unmutes audio if not originally muted."""
+    """Restores runtime autosuspend delay (2000ms) and unmutes audio if not originally muted."""
     if cfg.get("SLEEP_USB_AUTOSUSPEND", True):
         for audio_intf in glob.glob("/sys/bus/usb/drivers/snd-usb-audio/*:*"):
             try:
@@ -625,16 +625,6 @@ def restore_audio(cfg, saved_audio_state):
                         f.write("2000")
             except Exception:
                 pass
-
-    if cfg.get("SLEEP_CUSTOM_POWER_CUTS", True):
-        for hid_id in (cfg.get("CUSTOM_USBHID_UNBIND") or "").split():
-            dev_prefix = hid_id.split(":")[0]
-            if os.path.exists(f"/sys/bus/usb/devices/{dev_prefix}/{hid_id}") and not os.path.exists(f"/sys/bus/usb/drivers/usbhid/{hid_id}"):
-                try:
-                    with open("/sys/bus/usb/drivers/usbhid/bind", "w") as f:
-                        f.write(hid_id)
-                except Exception:
-                    pass
 
     if not cfg.get("SLEEP_MUTE_AUDIO", True):
         return
@@ -1198,10 +1188,11 @@ def read_interrupt_counts():
     return irqs
 
 
-def log_wakeup_report(t_start, soc_start, irqs_start):
+def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None):
     """Logs a concise 1-line standby summary (duration, battery delta & rate, top IRQs/s)."""
     try:
-        elapsed_s = max(0.1, time.monotonic() - t_start)
+        end_ts = t_end if t_end is not None else time.monotonic()
+        elapsed_s = max(0.1, end_ts - t_start)
         hours = elapsed_s / 3600.0
         dur_str = f"{hours:.2f}h" if hours >= 0.1 else f"{elapsed_s:.1f}s"
 
@@ -1215,7 +1206,8 @@ def log_wakeup_report(t_start, soc_start, irqs_start):
         else:
             bat_str = ""
 
-        irqs_end = read_interrupt_counts()
+        if irqs_end is None:
+            irqs_end = read_interrupt_counts()
         deltas = sorted(
             ((irqs_end[k] - irqs_start.get(k, 0), k) for k in irqs_end),
             reverse=True
@@ -1237,6 +1229,7 @@ def run_lid_daemon():
       - Lid opened in Clamshell Mode            -> Restores internal panel & keyboard immediately
     """
     lid_dev = get_lid_device_path()
+    set_usb_autosuspend(load_config())
     if not lid_dev:
         log("No hardware lid switch detected (Desktop Pi). Lid daemon exiting cleanly.")
         sys.exit(0)
@@ -1548,17 +1541,17 @@ def main():
             pass
 
     last_watchdog_check = time.time()
+    # Allow USB port disconnects & autosuspend to settle (~0.6s) before sampling baseline sleep IRQs
+    time.sleep(0.6)
     sleep_start_ts = time.monotonic()
     initial_irqs = read_interrupt_counts()
+    sleep_end_ts = None
+    final_irqs = None
     fan_thresh = cfg.get("WATCHDOG_THERMAL_TEMP_MC", 68000)
 
     try:
         while True:
             events = epoll.poll(timeout=2.0)
-
-            if lid_was_closed and cfg.get("WAKE_ON_LID_OPEN", True) and get_lid_state(lid_fd) == "open":
-                log("Lid opened (poll check) -> waking up")
-                break
 
             now = time.time()
             if (now - last_watchdog_check) >= 30.0:
@@ -1578,6 +1571,9 @@ def main():
                                 break
 
             if not events:
+                if lid_was_closed and cfg.get("WAKE_ON_LID_OPEN", True) and get_lid_state(lid_fd) == "open":
+                    log("Lid opened (fallback check) -> waking up")
+                    break
                 continue
 
             wake = False
@@ -1650,6 +1646,8 @@ def main():
     except KeyboardInterrupt:
         log("Sleep interrupted by signal -> waking up")
     finally:
+        sleep_end_ts = time.monotonic()
+        final_irqs = read_interrupt_counts()
         for fd in open_fds:
             try:
                 epoll.unregister(fd)
@@ -1693,7 +1691,7 @@ def main():
         except Exception:
             pass
         if cfg.get("LOG_WAKEUP_SUMMARY", True):
-            log_wakeup_report(sleep_start_ts, initial_soc, initial_irqs)
+            log_wakeup_report(sleep_start_ts, initial_soc, initial_irqs, t_end=sleep_end_ts, irqs_end=final_irqs)
         log("Wakeup complete, normal power & display restored")
 
     sys.exit(0)
