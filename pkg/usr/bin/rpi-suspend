@@ -569,6 +569,31 @@ def lock_sessions():
     time.sleep(0.15)
 
 
+def unlock_sessions():
+    """Unlocks desktop screensavers if a desktop power daemon erroneously locked the session on docked lid close."""
+    try:
+        subprocess.run(["loginctl", "unlock-sessions"], check=False, timeout=2)
+    except Exception:
+        pass
+    for bus in glob.glob("/run/user/*/bus"):
+        try:
+            uid = bus.split("/")[3]
+            env_vars = [f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}"]
+            for dest, path, iface in (
+                ("org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver", "org.cinnamon.ScreenSaver"),
+                ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver"),
+                ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver"),
+            ):
+                subprocess.run(
+                    ["sudo", "-u", f"#{uid}", "env"] + env_vars + [
+                        "busctl", "--user", "call", dest, path, iface, "SetActive", "b", "false"
+                    ],
+                    check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+        except Exception:
+            pass
+
+
 def get_audio_mute_state():
     """Returns saved mute states for ALSA Master and active pipewire user sessions."""
     state = {"amixer_muted": False, "pipewire_muted": {}}
@@ -649,11 +674,22 @@ def restore_audio(cfg, saved_audio_state):
             pass
 
 
-def blank_displays(target_connectors=None, do_dpms=True, do_backlight=True):
+def _xrandr_names(conn: str):
+    """Returns candidate X11 xrandr output names for a kernel DRM connector name (e.g. HDMI-A-2 -> HDMI-2, HDMI-A-2)."""
+    names = []
+    if conn.startswith("HDMI-A-"):
+        names.append(conn.replace("HDMI-A-", "HDMI-", 1))
+    if conn not in names:
+        names.append(conn)
+    return names
+
+
+def blank_displays(target_connectors=None, external_connectors=None, do_dpms=True, do_backlight=True):
     """
     Saves current brightness and blanks displays.
     If target_connectors is None, blanks ALL displays (full system suspend).
-    If target_connectors is a list (e.g. ['HDMI-A-2']), blanks ONLY those internal displays (Clamshell Mode).
+    If target_connectors is a list (e.g. ['HDMI-A-2']), blanks ONLY those internal displays (Clamshell Mode)
+    while keeping external_connectors (e.g. ['HDMI-A-1']) active.
     """
     saved_brightness = {}
     if do_backlight:
@@ -672,21 +708,11 @@ def blank_displays(target_connectors=None, do_dpms=True, do_backlight=True):
     if not do_dpms:
         return saved_brightness
 
-    if target_connectors is None:
-        for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
-            try:
-                with open(dpms, "w") as f:
-                    f.write("Off")
-            except Exception:
-                pass
-    else:
-        for conn in target_connectors:
-            for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
-                try:
-                    with open(dpms, "w") as f:
-                        f.write("Off")
-                except Exception:
-                    pass
+    # In Clamshell Mode (target_connectors is not None), desktop power managers like Cinnamon's csd-power
+    # react to UPower LidIsClosed by forcing global X11 DPMS Off across ALL monitors.
+    # Wait 0.4s so we can immediately re-enable global DPMS for the external monitor and turn off ONLY the internal panel.
+    if target_connectors is not None:
+        time.sleep(0.4)
 
     # Wayland DPMS / Output control
     for w in glob.glob("/run/user/*/wayland-*"):
@@ -740,12 +766,46 @@ def blank_displays(target_connectors=None, do_dpms=True, do_backlight=True):
                     if target_connectors is None and os.path.isfile("/usr/bin/xset"):
                         subprocess.run(base_cmd + ["xset", "dpms", "force", "off"],
                                        check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    elif target_connectors and os.path.isfile("/usr/bin/xrandr"):
-                        for conn in target_connectors:
-                            subprocess.run(base_cmd + ["xrandr", "--output", conn, "--off"],
+                    elif target_connectors is not None:
+                        # 1. Undo any global X11 DPMS Off triggered by csd-power / xfce4-power-manager on lid close
+                        if os.path.isfile("/usr/bin/xset"):
+                            subprocess.run(base_cmd + ["xset", "dpms", "force", "on"],
                                            check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                        # 2. Turn off internal X11 outputs (e.g. HDMI-2) and ensure external X11 outputs (e.g. HDMI-1) stay on
+                        if os.path.isfile("/usr/bin/xrandr"):
+                            for ext in (external_connectors or []):
+                                for xname in _xrandr_names(ext):
+                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--auto"],
+                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                            for conn in target_connectors:
+                                for xname in _xrandr_names(conn):
+                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--off"],
+                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
+
+    if target_connectors is None:
+        for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
+            try:
+                with open(dpms, "w") as f:
+                    f.write("Off")
+            except Exception:
+                pass
+    else:
+        for ext in (external_connectors or []):
+            for dpms in glob.glob(f"/sys/class/drm/card*-{ext}/dpms"):
+                try:
+                    with open(dpms, "w") as f:
+                        f.write("On")
+                except Exception:
+                    pass
+        for conn in target_connectors:
+            for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
+                try:
+                    with open(dpms, "w") as f:
+                        f.write("Off")
+                except Exception:
+                    pass
 
     return saved_brightness
 
@@ -753,6 +813,22 @@ def blank_displays(target_connectors=None, do_dpms=True, do_backlight=True):
 def restore_displays(saved_brightness, target_connectors=None, do_dpms=True, do_backlight=True):
     """Restores DRM DPMS and backlight brightness across Wayland and X11."""
     if do_dpms:
+        if target_connectors is None:
+            for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
+                try:
+                    with open(dpms, "w") as f:
+                        f.write("On")
+                except Exception:
+                    pass
+        else:
+            for conn in target_connectors:
+                for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
+                    try:
+                        with open(dpms, "w") as f:
+                            f.write("On")
+                    except Exception:
+                        pass
+
         for w in glob.glob("/run/user/*/wayland-*"):
             if w.endswith(".lock"):
                 continue
@@ -800,31 +876,16 @@ def restore_displays(saved_brightness, target_connectors=None, do_dpms=True, do_
                         if not os.path.isfile(xauth):
                             xauth = os.path.join(user_home, ".Xauthority")
                         base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
-                        if target_connectors is None and os.path.isfile("/usr/bin/xset"):
+                        if os.path.isfile("/usr/bin/xset"):
                             subprocess.run(base_cmd + ["xset", "dpms", "force", "on"],
                                            check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        elif target_connectors and os.path.isfile("/usr/bin/xrandr"):
+                        if target_connectors and os.path.isfile("/usr/bin/xrandr"):
                             for conn in target_connectors:
-                                subprocess.run(base_cmd + ["xrandr", "--output", conn, "--auto"],
-                                               check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                for xname in _xrandr_names(conn):
+                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--auto"],
+                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
-
-        if target_connectors is None:
-            for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
-                try:
-                    with open(dpms, "w") as f:
-                        f.write("On")
-                except Exception:
-                    pass
-        else:
-            for conn in target_connectors:
-                for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
-                    try:
-                        with open(dpms, "w") as f:
-                            f.write("On")
-                    except Exception:
-                        pass
 
     if do_backlight:
         for b_file, val in saved_brightness.items():
@@ -1274,9 +1335,12 @@ def run_lid_daemon():
                                     lock_sessions()
                                 saved_clamshell_brightness = blank_displays(
                                     target_connectors=internal_conns,
+                                    external_connectors=external_conns,
                                     do_dpms=cfg.get("CLAMSHELL_BLANK_INTERNAL_DISPLAY", True),
                                     do_backlight=cfg.get("CLAMSHELL_DIM_INTERNAL_BACKLIGHT", True),
                                 )
+                                if not cfg.get("CLAMSHELL_LOCK_ON_CLOSE", False):
+                                    unlock_sessions()
                                 set_keyboard_and_custom_power(
                                     cfg,
                                     enable=False,
