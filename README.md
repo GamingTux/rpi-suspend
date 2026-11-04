@@ -130,16 +130,47 @@ sudo rpi-suspend set-profile argon-oneup
 ### Example `rpi-suspend status` Output
 ```text
 === rpi-suspend Status ===
-Active Profile       : argon-oneup
-Profile File         : /usr/share/rpi-suspend/profiles/argon-oneup.conf
-Internal Displays    : eDP-1 HDMI-A-2
-Connected Displays   : HDMI-A-2
-External Displays    : (none)
-Lid Switch Device    : Lid Switch (/dev/input/event0)
-CPU parking (CPU0)   : True
-Network Suspend Mode : powersave
-Wake on Mouse Move   : False
-Custom Power Cuts    : 2 path(s)
+Active Profile            : argon-oneup
+Lid State                 : open (/dev/input/event0)
+Internal Displays         : ['HDMI-A-2'] (pattern: 'eDP-1 HDMI-A-2')
+External Displays         : none
+Battery SOC / AC          : 92% / AC=False
+
+--- Mode 1: Deep Standby (SLEEP_*) ---
+  SLEEP_LOCK_SCREEN            = true
+  SLEEP_PAUSE_MEDIA            = true
+  SLEEP_MUTE_AUDIO             = true
+  SLEEP_BLANK_DISPLAYS         = true
+  SLEEP_DIM_BACKLIGHT          = true
+  SLEEP_DIM_KBD_BACKLIGHT      = true
+  SLEEP_FREEZE_PROCESSES       = true
+  SLEEP_CPU_POWERSAVE          = true
+  SLEEP_CPU_PARKING            = true
+  SLEEP_WORKQUEUE_POWERSAVE    = true
+  SLEEP_USB_AUTOSUSPEND        = true
+  SLEEP_WIFI_POWERSAVE         = true
+  SLEEP_WIFI_RFKILL            = false
+  SLEEP_BLUETOOTH_RFKILL       = false
+  SLEEP_FAN_SILENT             = true
+  SLEEP_CUSTOM_POWER_CUTS      = true
+  SLEEP_RUN_HOOKS              = true
+
+--- Mode 2: Docked Clamshell (CLAMSHELL_*) ---
+  CLAMSHELL_ENABLE             = true
+  CLAMSHELL_SUSPEND_UNDOCKED   = true
+  CLAMSHELL_BLANK_INTERNAL_DISPLAY = true
+  CLAMSHELL_DIM_INTERNAL_BACKLIGHT = true
+  CLAMSHELL_DIM_KBD_BACKLIGHT  = true
+  CLAMSHELL_DISABLE_INTERNAL_INPUT = true
+  CLAMSHELL_LOCK_ON_CLOSE      = false
+  CLAMSHELL_RUN_HOOKS          = true
+
+--- Mode 3: Wakeup Sources (WAKE_*) ---
+  WAKE_ON_LID_OPEN             = true
+  WAKE_ON_POWER_BUTTON         = true
+  WAKE_ON_KEYBOARD             = true
+  WAKE_ON_MOUSE_CLICK          = true
+  WAKE_ON_MOUSE_MOVE           = false
 ```
 
 ---
@@ -150,6 +181,8 @@ The configuration is loaded in three layers (later layers override earlier ones)
 1. **Hardware Profile:** `/usr/share/rpi-suspend/profiles/<PROFILE>.conf`
 2. **Main Config:** `/etc/rpi-suspend.conf`
 3. **Drop-in Overrides:** `/etc/rpi-suspend.conf.d/*.conf`
+
+Every universal mechanism in [`/etc/rpi-suspend.conf`](pkg/etc/rpi-suspend.conf) is grouped by operating mode (`SLEEP_*`, `CLAMSHELL_*`, `WAKE_*`, `WATCHDOG_*`) and can be individually toggled via `true` or `false`.
 
 ### Custom Hook Scripts (`/etc/rpi-suspend/hooks.d/`)
 Want to run custom commands before sleeping, after waking up, or when docking/undocking? Place any executable script in `/etc/rpi-suspend/hooks.d/`:
@@ -182,9 +215,10 @@ Built a custom cyberdeck, handheld, or Pi laptop? Adding support for your hardwa
 ```ini
 # pkg/usr/share/rpi-suspend/profiles/my-cyberdeck.conf
 INTERNAL_DISPLAY="DSI-1"
-PARK_CPU_CORES=1
-SUSPEND_NETWORK="powersave"
 CUSTOM_POWER_CUT_PATHS="/sys/bus/usb/devices/1-1:1.0/1-1-port3/disable"
+CLAMSHELL_ENABLE=false
+WAKE_ON_KEYBOARD=true
+WAKE_ON_MOUSE_MOVE=false
 ```
 
 ---
