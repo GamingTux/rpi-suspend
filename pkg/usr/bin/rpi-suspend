@@ -320,19 +320,29 @@ def get_drm_connectors(cfg):
     """
     Classifies connected DRM displays into (internal_connectors, external_connectors)
     based on INTERNAL_DISPLAY patterns in cfg.
-    Returns lists of connector names (e.g. ['eDP-1'] or ['HDMI-A-2']).
+    Returns lists of connector names (e.g. ['eDP-1'] or ['HDMI-A-1']).
+    Also considers connectors with enabled == 'enabled' as active in case
+    hardware HPD transiently drops when the lid switch cuts 5V before GPIO debounce.
     """
     patterns = (cfg.get("INTERNAL_DISPLAY") or "eDP-* LVDS-* DSI-*").split()
     internal = []
     external = []
     for status_file in sorted(glob.glob("/sys/class/drm/card*-*/status")):
         try:
+            conn_dir = os.path.dirname(status_file)
+            card_conn = os.path.basename(conn_dir)
+            conn_name = card_conn.split("-", 1)[1] if "-" in card_conn else card_conn
+            if conn_name.startswith("Writeback"):
+                continue
             with open(status_file, "r") as f:
                 st = f.read().strip()
-            if st != "connected":
+            enabled_file = os.path.join(conn_dir, "enabled")
+            en = ""
+            if os.path.isfile(enabled_file):
+                with open(enabled_file, "r") as ef:
+                    en = ef.read().strip()
+            if st != "connected" and en != "enabled":
                 continue
-            card_conn = os.path.basename(os.path.dirname(status_file))
-            conn_name = card_conn.split("-", 1)[1] if "-" in card_conn else card_conn
             is_int = any(fnmatch.fnmatch(conn_name, pat) for pat in patterns)
             if is_int:
                 if conn_name not in internal:
@@ -546,52 +556,11 @@ def pause_media_players():
 
 
 def lock_sessions():
-    """Triggers universal desktop screen locking across logind, KDE, Cinnamon, GNOME, and XFCE."""
+    """Triggers standard systemd-logind session locking."""
     try:
         subprocess.run(["loginctl", "lock-sessions"], check=False, timeout=2)
     except Exception:
         pass
-    for bus in glob.glob("/run/user/*/bus"):
-        try:
-            uid = bus.split("/")[3]
-            env_vars = [f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}"]
-            for dest, path, iface in (
-                ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver"),
-                ("org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver", "org.cinnamon.ScreenSaver"),
-                ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver"),
-            ):
-                subprocess.run(
-                    ["sudo", "-u", f"#{uid}", "env"] + env_vars + ["busctl", "--user", "call", dest, path, iface, "Lock"],
-                    check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-        except Exception:
-            pass
-    time.sleep(0.15)
-
-
-def unlock_sessions():
-    """Unlocks desktop screensavers if a desktop power daemon erroneously locked the session on docked lid close."""
-    try:
-        subprocess.run(["loginctl", "unlock-sessions"], check=False, timeout=2)
-    except Exception:
-        pass
-    for bus in glob.glob("/run/user/*/bus"):
-        try:
-            uid = bus.split("/")[3]
-            env_vars = [f"XDG_RUNTIME_DIR=/run/user/{uid}", f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}"]
-            for dest, path, iface in (
-                ("org.cinnamon.ScreenSaver", "/org/cinnamon/ScreenSaver", "org.cinnamon.ScreenSaver"),
-                ("org.freedesktop.ScreenSaver", "/ScreenSaver", "org.freedesktop.ScreenSaver"),
-                ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver", "org.gnome.ScreenSaver"),
-            ):
-                subprocess.run(
-                    ["sudo", "-u", f"#{uid}", "env"] + env_vars + [
-                        "busctl", "--user", "call", dest, path, iface, "SetActive", "b", "false"
-                    ],
-                    check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-        except Exception:
-            pass
 
 
 def get_audio_mute_state():
@@ -674,22 +643,11 @@ def restore_audio(cfg, saved_audio_state):
             pass
 
 
-def _xrandr_names(conn: str):
-    """Returns candidate X11 xrandr output names for a kernel DRM connector name (e.g. HDMI-A-2 -> HDMI-2, HDMI-A-2)."""
-    names = []
-    if conn.startswith("HDMI-A-"):
-        names.append(conn.replace("HDMI-A-", "HDMI-", 1))
-    if conn not in names:
-        names.append(conn)
-    return names
-
-
 def blank_displays(target_connectors=None, external_connectors=None, do_dpms=True, do_backlight=True):
     """
-    Saves current brightness and blanks displays.
+    Saves current brightness and blanks displays via pure kernel sysfs (backlight & DRM DPMS).
     If target_connectors is None, blanks ALL displays (full system suspend).
-    If target_connectors is a list (e.g. ['HDMI-A-2']), blanks ONLY those internal displays (Clamshell Mode)
-    while keeping external_connectors (e.g. ['HDMI-A-1']) active.
+    If target_connectors is a list (e.g. ['eDP-1']), blanks ONLY those internal displays (Clamshell Mode).
     """
     saved_brightness = {}
     if do_backlight:
@@ -708,82 +666,6 @@ def blank_displays(target_connectors=None, external_connectors=None, do_dpms=Tru
     if not do_dpms:
         return saved_brightness
 
-    # In Clamshell Mode (target_connectors is not None), desktop power managers like Cinnamon's csd-power
-    # react to UPower LidIsClosed by forcing global X11 DPMS Off across ALL monitors.
-    # Wait 0.4s so we can immediately re-enable global DPMS for the external monitor and turn off ONLY the internal panel.
-    if target_connectors is not None:
-        time.sleep(0.4)
-
-    # Wayland DPMS / Output control
-    for w in glob.glob("/run/user/*/wayland-*"):
-        if w.endswith(".lock"):
-            continue
-        try:
-            uid = w.split("/")[3]
-            w_name = os.path.basename(w)
-            env_vars = ["sudo", "-u", f"#{uid}", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"WAYLAND_DISPLAY={w_name}"]
-            if target_connectors is None:
-                if os.path.isfile("/usr/bin/kscreen-doctor"):
-                    subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", "--dpms", "off"],
-                                   check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if os.path.isfile("/usr/bin/wlopm"):
-                    subprocess.run(env_vars + ["wlopm", "--off", "*"],
-                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                bus = f"/run/user/{uid}/bus"
-                if os.path.exists(bus):
-                    subprocess.run(
-                        env_vars + [f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
-                                    "busctl", "--user", "set-property", "org.gnome.Mutter.DisplayConfig",
-                                    "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig", "PowerSaveMode", "i", "3"],
-                        check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                    )
-            else:
-                for conn in target_connectors:
-                    if os.path.isfile("/usr/bin/kscreen-doctor"):
-                        subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", f"output.{conn}.disable"],
-                                       check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if os.path.isfile("/usr/bin/wlopm"):
-                        subprocess.run(env_vars + ["wlopm", "--off", conn],
-                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
-
-    # X11 DPMS / xrandr control
-    if os.path.isfile("/usr/bin/xset") or os.path.isfile("/usr/bin/xrandr"):
-        for xsock in glob.glob("/tmp/.X11-unix/X*"):
-            try:
-                disp = ":" + os.path.basename(xsock)[1:]
-                for bus in glob.glob("/run/user/*/bus"):
-                    uid = bus.split("/")[3]
-                    try:
-                        user_home = pwd.getpwuid(int(uid)).pw_dir
-                    except Exception:
-                        user_home = "/root"
-                    xauth = f"/run/user/{uid}/gdm/Xauthority"
-                    if not os.path.isfile(xauth):
-                        xauth = os.path.join(user_home, ".Xauthority")
-                    base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
-                    if target_connectors is None and os.path.isfile("/usr/bin/xset"):
-                        subprocess.run(base_cmd + ["xset", "dpms", "force", "off"],
-                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    elif target_connectors is not None:
-                        # 1. Undo any global X11 DPMS Off triggered by csd-power / xfce4-power-manager on lid close
-                        if os.path.isfile("/usr/bin/xset"):
-                            subprocess.run(base_cmd + ["xset", "dpms", "force", "on"],
-                                           check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        # 2. Turn off internal X11 outputs (e.g. HDMI-2) and ensure external X11 outputs (e.g. HDMI-1) stay on
-                        if os.path.isfile("/usr/bin/xrandr"):
-                            for ext in (external_connectors or []):
-                                for xname in _xrandr_names(ext):
-                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--auto"],
-                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                            for conn in target_connectors:
-                                for xname in _xrandr_names(conn):
-                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--off"],
-                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-
     if target_connectors is None:
         for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
             try:
@@ -792,13 +674,6 @@ def blank_displays(target_connectors=None, external_connectors=None, do_dpms=Tru
             except Exception:
                 pass
     else:
-        for ext in (external_connectors or []):
-            for dpms in glob.glob(f"/sys/class/drm/card*-{ext}/dpms"):
-                try:
-                    with open(dpms, "w") as f:
-                        f.write("On")
-                except Exception:
-                    pass
         for conn in target_connectors:
             for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
                 try:
@@ -811,7 +686,7 @@ def blank_displays(target_connectors=None, external_connectors=None, do_dpms=Tru
 
 
 def restore_displays(saved_brightness, target_connectors=None, do_dpms=True, do_backlight=True):
-    """Restores DRM DPMS and backlight brightness across Wayland and X11."""
+    """Restores DRM DPMS and backlight brightness via pure kernel sysfs."""
     if do_dpms:
         if target_connectors is None:
             for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
@@ -828,64 +703,6 @@ def restore_displays(saved_brightness, target_connectors=None, do_dpms=True, do_
                             f.write("On")
                     except Exception:
                         pass
-
-        for w in glob.glob("/run/user/*/wayland-*"):
-            if w.endswith(".lock"):
-                continue
-            try:
-                uid = w.split("/")[3]
-                w_name = os.path.basename(w)
-                env_vars = ["sudo", "-u", f"#{uid}", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"WAYLAND_DISPLAY={w_name}"]
-                if target_connectors is None:
-                    if os.path.isfile("/usr/bin/kscreen-doctor"):
-                        subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", "--dpms", "on"],
-                                       check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if os.path.isfile("/usr/bin/wlopm"):
-                        subprocess.run(env_vars + ["wlopm", "--on", "*"],
-                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    bus = f"/run/user/{uid}/bus"
-                    if os.path.exists(bus):
-                        subprocess.run(
-                            env_vars + [f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
-                                        "busctl", "--user", "set-property", "org.gnome.Mutter.DisplayConfig",
-                                        "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig", "PowerSaveMode", "i", "0"],
-                            check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                        )
-                else:
-                    for conn in target_connectors:
-                        if os.path.isfile("/usr/bin/kscreen-doctor"):
-                            subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", f"output.{conn}.enable", f"output.{conn}.mode.0"],
-                                           check=False, timeout=3, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        if os.path.isfile("/usr/bin/wlopm"):
-                            subprocess.run(env_vars + ["wlopm", "--on", conn],
-                                           check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
-
-        if os.path.isfile("/usr/bin/xset") or os.path.isfile("/usr/bin/xrandr"):
-            for xsock in glob.glob("/tmp/.X11-unix/X*"):
-                try:
-                    disp = ":" + os.path.basename(xsock)[1:]
-                    for bus in glob.glob("/run/user/*/bus"):
-                        uid = bus.split("/")[3]
-                        try:
-                            user_home = pwd.getpwuid(int(uid)).pw_dir
-                        except Exception:
-                            user_home = "/root"
-                        xauth = f"/run/user/{uid}/gdm/Xauthority"
-                        if not os.path.isfile(xauth):
-                            xauth = os.path.join(user_home, ".Xauthority")
-                        base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
-                        if os.path.isfile("/usr/bin/xset"):
-                            subprocess.run(base_cmd + ["xset", "dpms", "force", "on"],
-                                           check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        if target_connectors and os.path.isfile("/usr/bin/xrandr"):
-                            for conn in target_connectors:
-                                for xname in _xrandr_names(conn):
-                                    subprocess.run(base_cmd + ["xrandr", "--output", xname, "--auto"],
-                                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                except Exception:
-                    pass
 
     if do_backlight:
         for b_file, val in saved_brightness.items():
@@ -1283,11 +1100,11 @@ def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None)
 
 def run_lid_daemon():
     """
-    Lightweight epoll-based Lid & Clamshell Mode Daemon (0% CPU usage).
-    Monitors hardware SW_LID events:
-      - Lid closed + External monitor connected -> Clamshell Mode (turns off internal panel & keyboard only)
-      - Lid closed + No external monitor        -> Triggers full system suspend (systemctl suspend)
-      - Lid opened in Clamshell Mode            -> Restores internal panel & keyboard immediately
+    Lightweight epoll-based Hardware Lid Daemon (0% CPU usage).
+    Standard suspend & display reconfiguration on lid close are handled natively by
+    systemd-logind and the Desktop Environment (UPower / Mutter / Muffin / KWin).
+    This daemon only manages pure hardware sysfs power cuts for the physical lid
+    (internal panel backlight, internal DRM DPMS, and internal USB keyboard port).
     """
     lid_dev = get_lid_device_path()
     set_usb_autosuspend(load_config())
@@ -1295,7 +1112,7 @@ def run_lid_daemon():
         log("No hardware lid switch detected (Desktop Pi). Lid daemon exiting cleanly.")
         sys.exit(0)
 
-    log(f"Starting Lid & Clamshell daemon on {lid_dev}")
+    log(f"Starting Hardware Lid daemon on {lid_dev}")
     epoll = select.epoll()
     fd = os.open(lid_dev, os.O_RDONLY | os.O_NONBLOCK)
     epoll.register(fd, select.EPOLLIN)
@@ -1325,35 +1142,27 @@ def run_lid_daemon():
                         cfg = load_config()
                         if ev_val == 1:  # LID CLOSED
                             internal_conns, external_conns = get_drm_connectors(cfg)
-                            if external_conns and cfg.get("CLAMSHELL_ENABLE", True):
-                                log(f"Lid closed while docked to {external_conns} -> entering Clamshell Mode (disabling {internal_conns})")
+                            if cfg.get("CLAMSHELL_ENABLE", True):
+                                log(f"Lid closed -> turning off internal hardware panel & keyboard ({internal_conns})")
                                 in_clamshell = True
                                 clamshell_conns = internal_conns
                                 if cfg.get("CLAMSHELL_RUN_HOOKS", True):
                                     run_hooks("docked")
-                                if cfg.get("CLAMSHELL_LOCK_ON_CLOSE", False):
-                                    lock_sessions()
                                 saved_clamshell_brightness = blank_displays(
                                     target_connectors=internal_conns,
                                     external_connectors=external_conns,
                                     do_dpms=cfg.get("CLAMSHELL_BLANK_INTERNAL_DISPLAY", True),
                                     do_backlight=cfg.get("CLAMSHELL_DIM_INTERNAL_BACKLIGHT", True),
                                 )
-                                if not cfg.get("CLAMSHELL_LOCK_ON_CLOSE", False):
-                                    unlock_sessions()
                                 set_keyboard_and_custom_power(
                                     cfg,
                                     enable=False,
                                     do_kbd_backlight=cfg.get("CLAMSHELL_DIM_KBD_BACKLIGHT", True),
                                     do_custom_cuts=cfg.get("CLAMSHELL_DISABLE_INTERNAL_INPUT", True),
                                 )
-                            elif cfg.get("CLAMSHELL_SUSPEND_UNDOCKED", True):
-                                if not os.path.exists(ACTIVE_LOCK_FILE):
-                                    log("Lid closed with no external display -> triggering system suspend")
-                                    subprocess.run(["systemctl", "suspend", "--no-block"], check=False)
                         elif ev_val == 0:  # LID OPENED
                             if in_clamshell:
-                                log("Lid opened in Clamshell Mode -> restoring internal display & keyboard")
+                                log("Lid opened -> restoring internal hardware panel & keyboard")
                                 set_keyboard_and_custom_power(
                                     cfg,
                                     enable=True,
