@@ -209,6 +209,18 @@ def load_config():
         _parse_kv_file(dropin, probe)
 
     profile_name = probe.get("PROFILE", "generic") or "generic"
+    if profile_name in ("generic", "auto"):
+        if os.path.isdir("/sys/bus/i2c/drivers/cw2217") or os.path.isdir("/sys/bus/i2c/drivers/oneup-battery"):
+            profile_name = "argon-oneup"
+        else:
+            for vfile in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+                try:
+                    with open(vfile, "r") as vf:
+                        if vf.read().strip().lower() == "6080":
+                            profile_name = "argon-oneup"
+                            break
+                except Exception:
+                    pass
     cfg["PROFILE"] = profile_name
 
     # Load hardware profile if present
