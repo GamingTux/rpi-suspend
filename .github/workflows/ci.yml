@@ -59,3 +59,13 @@ jobs:
             rpi-suspend_*.deb
             rpi-suspend.deb
           generate_release_notes: true
+
+      - name: Dispatch update to Argon ONE UP Suite
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: peter-evans/repository-dispatch@v3
+        continue-on-error: true
+        with:
+          token: ${{ secrets.REPO_DISPATCH_PAT || github.token }}
+          repository: GamingTux/argon-oneup-suite
+          event-type: rpi-suspend-release
+          client-payload: '{"version": "${{ github.ref_name }}"}'
