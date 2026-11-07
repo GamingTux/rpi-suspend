@@ -679,18 +679,61 @@ def blank_displays(target_connectors=None, external_connectors=None, do_dpms=Tru
         return saved_brightness
 
     if target_connectors is None:
-        for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
+        # 1. Console / Framebuffer blank
+        for fb_blank in glob.glob("/sys/class/graphics/fb*/blank"):
             try:
-                with open(dpms, "w") as f:
-                    f.write("Off")
+                with open(fb_blank, "w") as f:
+                    f.write("1")
             except Exception:
                 pass
-    else:
-        for conn in target_connectors:
-            for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
+
+        # 2. Wayland DPMS Off
+        for w in glob.glob("/run/user/*/wayland-*"):
+            if w.endswith(".lock"):
+                continue
+            try:
+                uid = w.split("/")[3]
+                w_name = os.path.basename(w)
+                env_vars = ["sudo", "-u", f"#{uid}", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"WAYLAND_DISPLAY={w_name}"]
+                if os.path.isfile("/usr/bin/kscreen-doctor"):
+                    subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", "--dpms", "off"],
+                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if os.path.isfile("/usr/bin/wlopm"):
+                    subprocess.run(env_vars + ["wlopm", "--off", "*"],
+                                   check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                bus = f"/run/user/{uid}/bus"
+                if os.path.exists(bus):
+                    subprocess.run(
+                        env_vars + [f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
+                                    "busctl", "--user", "set-property", "org.gnome.Mutter.DisplayConfig",
+                                    "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig", "PowerSaveMode", "i", "3"],
+                        check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+            except Exception:
+                pass
+
+        # 3. X11 DPMS Off
+        if os.path.isfile("/usr/bin/xset"):
+            for xsock in glob.glob("/tmp/.X11-unix/X*"):
                 try:
-                    with open(dpms, "w") as f:
-                        f.write("Off")
+                    disp = ":" + os.path.basename(xsock)[1:]
+                    for bus in glob.glob("/run/user/*/bus"):
+                        uid = bus.split("/")[3]
+                        try:
+                            user_home = pwd.getpwuid(int(uid)).pw_dir
+                        except Exception:
+                            user_home = "/root"
+                        xauth = f"/run/user/{uid}/gdm/Xauthority"
+                        if not os.path.isfile(xauth) or os.path.getsize(xauth) == 0:
+                            xauth = os.path.join(user_home, ".Xauthority")
+                        if os.path.isfile(xauth) and os.path.getsize(xauth) > 0:
+                            base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
+                        elif os.path.isfile(f"/var/run/lightdm/root/{disp}"):
+                            base_cmd = ["env", f"DISPLAY={disp}", f"XAUTHORITY=/var/run/lightdm/root/{disp}"]
+                        else:
+                            base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
+                        subprocess.run(base_cmd + ["xset", "dpms", "force", "off"],
+                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 except Exception:
                     pass
 
@@ -698,21 +741,64 @@ def blank_displays(target_connectors=None, external_connectors=None, do_dpms=Tru
 
 
 def restore_displays(saved_brightness, target_connectors=None, do_dpms=True, do_backlight=True):
-    """Restores DRM DPMS and backlight brightness via pure kernel sysfs."""
+    """Restores DPMS and backlight brightness on wakeup."""
     if do_dpms:
         if target_connectors is None:
-            for dpms in glob.glob("/sys/class/drm/card*-*/dpms"):
+            # 1. Console / Framebuffer unblank
+            for fb_blank in glob.glob("/sys/class/graphics/fb*/blank"):
                 try:
-                    with open(dpms, "w") as f:
-                        f.write("On")
+                    with open(fb_blank, "w") as f:
+                        f.write("0")
                 except Exception:
                     pass
-        else:
-            for conn in target_connectors:
-                for dpms in glob.glob(f"/sys/class/drm/card*-{conn}/dpms"):
+
+            # 2. Wayland DPMS On
+            for w in glob.glob("/run/user/*/wayland-*"):
+                if w.endswith(".lock"):
+                    continue
+                try:
+                    uid = w.split("/")[3]
+                    w_name = os.path.basename(w)
+                    env_vars = ["sudo", "-u", f"#{uid}", "env", f"XDG_RUNTIME_DIR=/run/user/{uid}", f"WAYLAND_DISPLAY={w_name}"]
+                    if os.path.isfile("/usr/bin/kscreen-doctor"):
+                        subprocess.run(env_vars + ["QT_QPA_PLATFORM=wayland", "kscreen-doctor", "--dpms", "on"],
+                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    if os.path.isfile("/usr/bin/wlopm"):
+                        subprocess.run(env_vars + ["wlopm", "--on", "*"],
+                                       check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    bus = f"/run/user/{uid}/bus"
+                    if os.path.exists(bus):
+                        subprocess.run(
+                            env_vars + [f"DBUS_SESSION_BUS_ADDRESS=unix:path={bus}",
+                                        "busctl", "--user", "set-property", "org.gnome.Mutter.DisplayConfig",
+                                        "/org/gnome/Mutter/DisplayConfig", "org.gnome.Mutter.DisplayConfig", "PowerSaveMode", "i", "0"],
+                            check=False, timeout=1, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                        )
+                except Exception:
+                    pass
+
+            # 3. X11 DPMS On
+            if os.path.isfile("/usr/bin/xset"):
+                for xsock in glob.glob("/tmp/.X11-unix/X*"):
                     try:
-                        with open(dpms, "w") as f:
-                            f.write("On")
+                        disp = ":" + os.path.basename(xsock)[1:]
+                        for bus in glob.glob("/run/user/*/bus"):
+                            uid = bus.split("/")[3]
+                            try:
+                                user_home = pwd.getpwuid(int(uid)).pw_dir
+                            except Exception:
+                                user_home = "/root"
+                            xauth = f"/run/user/{uid}/gdm/Xauthority"
+                            if not os.path.isfile(xauth) or os.path.getsize(xauth) == 0:
+                                xauth = os.path.join(user_home, ".Xauthority")
+                            if os.path.isfile(xauth) and os.path.getsize(xauth) > 0:
+                                base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
+                            elif os.path.isfile(f"/var/run/lightdm/root/{disp}"):
+                                base_cmd = ["env", f"DISPLAY={disp}", f"XAUTHORITY=/var/run/lightdm/root/{disp}"]
+                            else:
+                                base_cmd = ["sudo", "-u", f"#{uid}", "env", f"DISPLAY={disp}", f"XAUTHORITY={xauth}"]
+                            subprocess.run(base_cmd + ["xset", "dpms", "force", "on"],
+                                           check=False, timeout=2, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     except Exception:
                         pass
 
