@@ -1495,15 +1495,27 @@ def main():
         do_custom_cuts=cfg.get("SLEEP_CUSTOM_POWER_CUTS", True),
     )
 
-    # 7. Open input devices and wait via epoll (0% CPU, <1ms interrupt wake)
+    # Allow USB port power cuts, disconnects & autosuspend to settle before opening input devices
+    time.sleep(0.6)
+
+    # 7. Open surviving input devices and wait via epoll (0% CPU, <1ms interrupt wake)
     epoll = select.epoll()
     open_fds = []
     lid_dev_path = get_lid_device_path()
     lid_fd = None
 
-    for dev in glob.glob("/dev/input/event*"):
+    for dev in sorted(glob.glob("/dev/input/event*")):
         try:
             fd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            # Flush any stale events or disconnect noise from before/during sleep entry
+            try:
+                while True:
+                    chunk = os.read(fd, EVENT_SIZE * 64)
+                    if not chunk or len(chunk) < EVENT_SIZE:
+                        break
+            except (BlockingIOError, OSError):
+                pass
+
             epoll.register(fd, select.EPOLLIN)
             open_fds.append(fd)
             if dev == lid_dev_path:
@@ -1511,11 +1523,15 @@ def main():
         except Exception:
             pass
 
-    last_watchdog_check = time.time()
-    # Allow USB port disconnects & autosuspend to settle (~0.6s) before sampling baseline sleep IRQs
-    time.sleep(0.6)
+    # Flush any leftover epoll readiness flags from registration
+    try:
+        epoll.poll(timeout=0)
+    except Exception:
+        pass
+
     sleep_start_ts = time.monotonic()
     initial_irqs = read_interrupt_counts()
+    last_watchdog_check = time.time()
     sleep_end_ts = None
     final_irqs = None
     fan_thresh = cfg.get("WATCHDOG_THERMAL_TEMP_MC", 68000)
@@ -1579,12 +1595,13 @@ def main():
 
                         # EV_SW (5), SW_LID (0) -> 0 = OPEN, 1 = CLOSED
                         if ev_type == 5 and ev_code == 0:
-                            if ev_val == 0 and cfg.get("WAKE_ON_LID_OPEN", True):
-                                log("Lid opened -> waking up")
-                                wake = True
-                                break
-                            elif ev_val == 1:
+                            if ev_val == 1:
                                 lid_was_closed = True
+                            elif ev_val == 0:
+                                if lid_was_closed and cfg.get("WAKE_ON_LID_OPEN", True):
+                                    log("Lid opened -> waking up")
+                                    wake = True
+                                    break
 
                         # EV_KEY (1) -> 1 = key/button press
                         elif ev_type == 1 and ev_val == 1:
@@ -1599,7 +1616,7 @@ def main():
                                     wake = True
                                     break
                             else:
-                                if cfg.get("WAKE_ON_KEYBOARD", True):
+                                if not lid_was_closed and cfg.get("WAKE_ON_KEYBOARD", True):
                                     log(f"Keyboard key pressed (code {ev_code}) -> waking up")
                                     wake = True
                                     break
