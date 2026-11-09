@@ -52,6 +52,7 @@ BOOL_KEYS = (
     "SLEEP_WIFI_RFKILL",
     "SLEEP_BLUETOOTH_RFKILL",
     "SLEEP_FAN_SILENT",
+    "SLEEP_NVME_POWERSAVE",
     "SLEEP_CUSTOM_POWER_CUTS",
     "SLEEP_RUN_HOOKS",
     # Mode 2: Docked Clamshell Mode (CLAMSHELL_*)
@@ -127,6 +128,7 @@ def default_config():
         "SLEEP_WIFI_RFKILL": False,
         "SLEEP_BLUETOOTH_RFKILL": False,
         "SLEEP_FAN_SILENT": True,
+        "SLEEP_NVME_POWERSAVE": False,
         "SLEEP_CUSTOM_POWER_CUTS": True,
         "SLEEP_RUN_HOOKS": True,
         # --- Mode 2: Docked Clamshell Mode (CLAMSHELL_*) ---
@@ -591,8 +593,11 @@ def set_usb_autosuspend(cfg):
 
 def restore_usb_autosuspend(cfg, unbound_hids=None):
     """Restores USB HID devices that were unbound during sleep."""
+    all_targets = set((cfg.get("CUSTOM_USBHID_UNBIND") or "").split())
     if unbound_hids:
-        for hid_id in unbound_hids:
+        all_targets.update(unbound_hids)
+    for hid_id in all_targets:
+        if os.path.exists(f"/sys/bus/usb/devices/{hid_id}") and not os.path.exists(f"/sys/bus/usb/drivers/usbhid/{hid_id}"):
             try:
                 with open("/sys/bus/usb/drivers/usbhid/bind", "w") as f:
                     f.write(hid_id)
@@ -1131,6 +1136,62 @@ def seed_thermal_cooling_state():
         pass
 
 
+_saved_nvme_state = {}
+
+
+def set_nvme_powersave(enable: bool):
+    """
+    Optional NVMe APST deep power saving (disabled by default).
+    Flushes buffers and relaxes PM QoS latency tolerance during sleep to allow
+    NVMe drives with supported controllers to enter deep non-operational states (PS3/PS4).
+    Restores original latency on wake.
+    """
+    global _saved_nvme_state
+    if not enable:
+        for p, val in _saved_nvme_state.items():
+            try:
+                with open(p, "w") as f:
+                    f.write(val)
+            except Exception:
+                pass
+        _saved_nvme_state.clear()
+        return
+
+    # Flush file buffers to disk before putting NVMe into deep sleep
+    try:
+        os.sync()
+    except Exception:
+        pass
+
+    param_path = "/sys/module/nvme_core/parameters/default_ps_max_latency_us"
+    if os.path.isfile(param_path):
+        try:
+            with open(param_path, "r") as f:
+                _saved_nvme_state[param_path] = f.read().strip()
+            with open(param_path, "w") as f:
+                f.write("100000")
+        except Exception:
+            pass
+
+    for nvme_qos in glob.glob("/sys/class/nvme/nvme*/power/pm_qos_latency_tolerance_us"):
+        try:
+            with open(nvme_qos, "r") as f:
+                _saved_nvme_state[nvme_qos] = f.read().strip()
+            with open(nvme_qos, "w") as f:
+                f.write("100000")
+        except Exception:
+            pass
+
+    for nvme_ctrl in glob.glob("/sys/class/nvme/nvme*/power/control"):
+        try:
+            with open(nvme_ctrl, "r") as f:
+                _saved_nvme_state[nvme_ctrl] = f.read().strip()
+            with open(nvme_ctrl, "w") as f:
+                f.write("auto")
+        except Exception:
+            pass
+
+
 def set_fan_sleep_mode(cfg, sleep: bool, saved_state=None):
     """Stops the PWM fan during sleep for 0 dB standby, and restores kernel thermal control on wakeup."""
     if not cfg.get("SLEEP_FAN_SILENT", True):
@@ -1574,6 +1635,8 @@ def main():
     if cfg.get("SLEEP_BLUETOOTH_RFKILL", False) and not saved_bt_blocked:
         set_radio_power("bluetooth", False)
     saved_fan_state = set_fan_sleep_mode(cfg, True)
+    if cfg.get("SLEEP_NVME_POWERSAVE", False):
+        set_nvme_powersave(True)
 
     # 6. Turn off keyboard backlight & custom power paths in sleep
     set_keyboard_and_custom_power(
@@ -1764,6 +1827,8 @@ def main():
             set_radio_power("wifi", True)
         elif cfg.get("SLEEP_WIFI_POWERSAVE", True):
             set_wifi_power_save(saved_wifi_powersave)
+        if cfg.get("SLEEP_NVME_POWERSAVE", False):
+            set_nvme_powersave(False)
         restore_usb_autosuspend(cfg, saved_unbound_hids)
         restore_audio(cfg, saved_audio_mute)
         if cfg.get("SLEEP_RUN_HOOKS", True):

@@ -47,7 +47,7 @@ CUSTOM_USBHID_UNBIND="1-1.1:1.3"
 
 
 # ------------------------------------------------------------------------------
-# 4. WIRELESS RADIO POWER SAVINGS (RFKILL)
+# 4. WIRELESS RADIO & STORAGE POWER SAVINGS
 # ------------------------------------------------------------------------------
 # Soft-block Wi-Fi (BCM43455) via rfkill during sleep. Prevents the radio from
 # waking up for router beacon frames / DTIM, saving ~0.3-0.5W. Reconnects on wake.
@@ -55,6 +55,11 @@ SLEEP_WIFI_RFKILL=true
 
 # Soft-block Bluetooth via rfkill during sleep and restore state on wake.
 SLEEP_BLUETOOTH_RFKILL=true
+
+# Optional: Deep NVMe APST power-saving. Disabled by default (false) for safety.
+# Set to 'true' only if your NVMe SSD controller is known to handle deep APST
+# transitions reliably without PCIe wake timeouts.
+# SLEEP_NVME_POWERSAVE=false
 
 
 # ------------------------------------------------------------------------------
