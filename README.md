@@ -184,6 +184,9 @@ The configuration is loaded in three layers (later layers override earlier ones)
 
 Every universal mechanism in [`/etc/rpi-suspend.conf`](pkg/etc/rpi-suspend.conf) is grouped by operating mode (`SLEEP_*`, `CLAMSHELL_*`, `WAKE_*`, `WATCHDOG_*`) and can be individually toggled via `true` or `false`.
 
+### Drop-in Overrides (`/etc/rpi-suspend.conf.d/`)
+To customize specific hardware without modifying global package files, place drop-in `.conf` files into `/etc/rpi-suspend.conf.d/`. See [`examples/90-argon-oneup.conf.example`](examples/90-argon-oneup.conf.example) for a complete reference configuration.
+
 ### Custom Hook Scripts (`/etc/rpi-suspend/hooks.d/`)
 Want to run custom commands before sleeping, after waking up, or when docking/undocking? Place any executable script in `/etc/rpi-suspend/hooks.d/`:
 
