@@ -1197,26 +1197,37 @@ def set_nvme_powersave(enable: bool):
 _saved_mmc_unbound = []
 
 
-def is_root_on_sd() -> bool:
-    """Checks if root or boot filesystem is running from a microSD/MMC card (mmcblk0)."""
+def is_sd_card_active_or_present() -> bool:
+    """
+    Checks if an SD card or eMMC storage device is physically present, in use, or mounted.
+    Returns True if:
+      1. Any filesystem is mounted from mmcblk (e.g. root, boot, or external data mount).
+      2. Any mmcblk block device is detected by the kernel (meaning an SD card is physically inserted or eMMC is present).
+    """
     try:
         with open("/proc/mounts", "r") as f:
             for line in f:
                 parts = line.split()
-                if len(parts) >= 2 and parts[1] in ("/", "/boot", "/boot/firmware"):
-                    if "mmcblk0" in parts[0]:
-                        return True
+                if len(parts) >= 2 and "mmcblk" in parts[0]:
+                    return True
     except Exception:
         pass
+
+    if glob.glob("/sys/class/block/mmcblk*"):
+        return True
+
     return False
+
+
+is_root_on_sd = is_sd_card_active_or_present
 
 
 def set_sd_slot_powersave(enable: bool):
     """
-    Optional microSD slot power saving (disabled by default).
-    Unbinds the SDHCI controller during sleep on NVMe/eMMC/USB systems to eliminate
-    empty slot polling timeouts and IRQs. Restores on wakeup.
-    Safely bypassed if root or boot is running from mmcblk0.
+    Optional microSD slot power saving (disabled by default in generic profile).
+    Unbinds the SDHCI controller during sleep on NVMe/USB systems to eliminate
+    empty slot polling timeouts and IRQs (~20 IRQs/s). Restores on wakeup.
+    Safely bypassed if an SD card/eMMC is mounted, booted from, or physically inserted.
     """
     global _saved_mmc_unbound
     sd_driver_dir = "/sys/bus/platform/drivers/sdhci-brcmstb"
@@ -1235,8 +1246,8 @@ def set_sd_slot_powersave(enable: bool):
             _saved_mmc_unbound = []
         return
 
-    # Fail-safe: Never touch SD controller if the operating system is booted from SD card!
-    if is_root_on_sd():
+    # Fail-safe: Never touch SD controller if an SD card/eMMC is mounted, booted from, or physically inserted!
+    if is_sd_card_active_or_present():
         return
 
     if os.path.exists(sd_driver_dir):

@@ -27,7 +27,7 @@ Measured on a Raspberry Pi 5 (8 GB) laptop (Argon ONE UP, NVMe SSD, Wi-Fi connec
 | :--- | :---: | :---: | :---: | :---: |
 | **Desktop Idle (Screen 100%, CPU `ondemand`)** | `7.21 W` | `451 mA` | — | ~7.7 hours |
 | **Desktop Idle (Screen Blanked only)** | `5.10 W` | `319 mA` | `-29.3%` | ~11.0 hours |
-| **🌙 `rpi-suspend` Active (`s2idle`)** | **`2.88 W`** | **`180 mA`** | **`-58.5%`** | **~19.5 hours** |
+| **🌙 `rpi-suspend` Active (`s2idle`)** | **`2.10 W`** | **`190 mA`** | **`-70.9%`** | **~25.4 hours** |
 
 > [!NOTE]
 > Even on a **desktop Raspberry Pi 5** connected to a wall adapter, `rpi-suspend` puts your HDMI monitors into hardware DPMS standby, pauses active YouTube/Spotify media streams, mutes audio, freezes background browser/application load to `0%`, parks Cores 1–3, and throttles the cooling fan down to silent standby while waking up in `<1 ms` on the first keystroke or mouse click.
