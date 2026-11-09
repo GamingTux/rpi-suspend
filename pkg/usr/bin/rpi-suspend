@@ -53,6 +53,7 @@ BOOL_KEYS = (
     "SLEEP_BLUETOOTH_RFKILL",
     "SLEEP_FAN_SILENT",
     "SLEEP_NVME_POWERSAVE",
+    "SLEEP_SD_SLOT_POWERSAVE",
     "SLEEP_CUSTOM_POWER_CUTS",
     "SLEEP_RUN_HOOKS",
     # Mode 2: Docked Clamshell Mode (CLAMSHELL_*)
@@ -129,6 +130,7 @@ def default_config():
         "SLEEP_BLUETOOTH_RFKILL": False,
         "SLEEP_FAN_SILENT": True,
         "SLEEP_NVME_POWERSAVE": False,
+        "SLEEP_SD_SLOT_POWERSAVE": False,
         "SLEEP_CUSTOM_POWER_CUTS": True,
         "SLEEP_RUN_HOOKS": True,
         # --- Mode 2: Docked Clamshell Mode (CLAMSHELL_*) ---
@@ -1192,6 +1194,63 @@ def set_nvme_powersave(enable: bool):
             pass
 
 
+_saved_mmc_unbound = []
+
+
+def is_root_on_sd() -> bool:
+    """Checks if root or boot filesystem is running from a microSD/MMC card (mmcblk0)."""
+    try:
+        with open("/proc/mounts", "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[1] in ("/", "/boot", "/boot/firmware"):
+                    if "mmcblk0" in parts[0]:
+                        return True
+    except Exception:
+        pass
+    return False
+
+
+def set_sd_slot_powersave(enable: bool):
+    """
+    Optional microSD slot power saving (disabled by default).
+    Unbinds the SDHCI controller during sleep on NVMe/eMMC/USB systems to eliminate
+    empty slot polling timeouts and IRQs. Restores on wakeup.
+    Safely bypassed if root or boot is running from mmcblk0.
+    """
+    global _saved_mmc_unbound
+    sd_driver_dir = "/sys/bus/platform/drivers/sdhci-brcmstb"
+    candidate_devices = ("1000fff000.mmc", "fe340000.mmc", "fe300000.mmc")
+
+    if not enable:
+        if _saved_mmc_unbound and os.path.exists(sd_driver_dir):
+            for dev_id in _saved_mmc_unbound:
+                dev_path = os.path.join(sd_driver_dir, dev_id)
+                if not os.path.exists(dev_path):
+                    try:
+                        with open(os.path.join(sd_driver_dir, "bind"), "w") as f:
+                            f.write(dev_id)
+                    except Exception:
+                        pass
+            _saved_mmc_unbound = []
+        return
+
+    # Fail-safe: Never touch SD controller if the operating system is booted from SD card!
+    if is_root_on_sd():
+        return
+
+    if os.path.exists(sd_driver_dir):
+        for dev_id in candidate_devices:
+            dev_path = os.path.join(sd_driver_dir, dev_id)
+            if os.path.exists(dev_path):
+                try:
+                    with open(os.path.join(sd_driver_dir, "unbind"), "w") as f:
+                        f.write(dev_id)
+                    _saved_mmc_unbound.append(dev_id)
+                except Exception:
+                    pass
+
+
 def set_fan_sleep_mode(cfg, sleep: bool, saved_state=None):
     """Stops the PWM fan during sleep for 0 dB standby, and restores kernel thermal control on wakeup."""
     if not cfg.get("SLEEP_FAN_SILENT", True):
@@ -1637,6 +1696,8 @@ def main():
     saved_fan_state = set_fan_sleep_mode(cfg, True)
     if cfg.get("SLEEP_NVME_POWERSAVE", False):
         set_nvme_powersave(True)
+    if cfg.get("SLEEP_SD_SLOT_POWERSAVE", False):
+        set_sd_slot_powersave(True)
 
     # 6. Turn off keyboard backlight & custom power paths in sleep
     set_keyboard_and_custom_power(
@@ -1829,6 +1890,8 @@ def main():
             set_wifi_power_save(saved_wifi_powersave)
         if cfg.get("SLEEP_NVME_POWERSAVE", False):
             set_nvme_powersave(False)
+        if cfg.get("SLEEP_SD_SLOT_POWERSAVE", False):
+            set_sd_slot_powersave(False)
         restore_usb_autosuspend(cfg, saved_unbound_hids)
         restore_audio(cfg, saved_audio_mute)
         if cfg.get("SLEEP_RUN_HOOKS", True):
