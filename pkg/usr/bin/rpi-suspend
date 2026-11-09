@@ -378,6 +378,49 @@ def read_battery_soc():
     return None
 
 
+def read_battery_energy_uwh():
+    """Reads current battery energy in micro-watt-hours (uWh), or None."""
+    for p in glob.glob("/sys/class/power_supply/BAT*/energy_now") + glob.glob("/sys/class/power_supply/*battery*/energy_now"):
+        try:
+            with open(p, "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+    charge = read_battery_charge_uah()
+    voltage = read_battery_voltage_uv()
+    if charge is not None and voltage is not None and charge > 0 and voltage > 0:
+        return int((charge * voltage) / 1e6)
+    return None
+
+
+def read_battery_charge_uah():
+    """Reads current battery charge in micro-ampere-hours (uAh), or None."""
+    for p in glob.glob("/sys/class/power_supply/BAT*/charge_now") + glob.glob("/sys/class/power_supply/*battery*/charge_now"):
+        try:
+            with open(p, "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+    return None
+
+
+def read_battery_voltage_uv():
+    """Reads current battery voltage in micro-volts (uV), or None."""
+    for p in glob.glob("/sys/class/power_supply/BAT*/voltage_now") + glob.glob("/sys/class/power_supply/*battery*/voltage_now"):
+        try:
+            with open(p, "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+    return None
+
+
 def is_on_ac():
     """Returns True if mains/AC charger is connected."""
     for p in (
@@ -1164,8 +1207,9 @@ def read_interrupt_counts():
     return irqs
 
 
-def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None):
-    """Logs a concise 1-line standby summary (duration, battery delta & rate, top IRQs/s)."""
+def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None,
+                      energy_start=None, charge_start=None, energy_end=None, charge_end=None):
+    """Logs a concise 1-line standby summary (duration, battery delta & rate, power, top IRQs/s)."""
     try:
         end_ts = t_end if t_end is not None else time.monotonic()
         elapsed_s = max(0.1, end_ts - t_start)
@@ -1182,6 +1226,35 @@ def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None)
         else:
             bat_str = ""
 
+        # Calculate exact average power draw (W) and current (mA) from hardware coulomb counter
+        if energy_end is None:
+            energy_end = read_battery_energy_uwh()
+        if charge_end is None:
+            charge_end = read_battery_charge_uah()
+
+        pwr_str = ""
+        if elapsed_s >= 5.0 and hours > 0:
+            if energy_start is not None and energy_end is not None:
+                delta_uwh = energy_start - energy_end
+                if delta_uwh > 0:
+                    avg_watts = (delta_uwh / 1e6) / hours
+                    pwr_str += f", Ø {avg_watts:.2f}W"
+                elif delta_uwh < 0:
+                    charge_w = (abs(delta_uwh) / 1e6) / hours
+                    pwr_str += f", charging (+{charge_w:.2f}W)"
+
+            if charge_start is not None and charge_end is not None:
+                delta_uah = charge_start - charge_end
+                if delta_uah > 0:
+                    avg_ma = (delta_uah / 1e3) / hours
+                    if pwr_str:
+                        pwr_str += f" ({avg_ma:.0f}mA)"
+                    else:
+                        pwr_str += f", Ø {avg_ma:.0f}mA"
+                elif delta_uah < 0 and not pwr_str:
+                    charge_ma = (abs(delta_uah) / 1e3) / hours
+                    pwr_str += f", charging (+{charge_ma:.0f}mA)"
+
         if irqs_end is None:
             irqs_end = read_interrupt_counts()
         deltas = sorted(
@@ -1191,7 +1264,7 @@ def log_wakeup_report(t_start, soc_start, irqs_start, t_end=None, irqs_end=None)
         top_irqs = ", ".join(f"{k} {d / elapsed_s:.1f}/s" for d, k in deltas if d > 0)
         irq_str = f"; top IRQs: {top_irqs}" if top_irqs else ""
 
-        log(f"Standby summary: {dur_str}{bat_str}{irq_str}")
+        log(f"Standby summary: {dur_str}{bat_str}{pwr_str}{irq_str}")
     except Exception:
         pass
 
@@ -1531,9 +1604,13 @@ def main():
 
     sleep_start_ts = time.monotonic()
     initial_irqs = read_interrupt_counts()
+    initial_energy = read_battery_energy_uwh()
+    initial_charge = read_battery_charge_uah()
     last_watchdog_check = time.time()
     sleep_end_ts = None
     final_irqs = None
+    final_energy = None
+    final_charge = None
     fan_thresh = cfg.get("WATCHDOG_THERMAL_TEMP_MC", 68000)
 
     try:
@@ -1636,6 +1713,8 @@ def main():
     finally:
         sleep_end_ts = time.monotonic()
         final_irqs = read_interrupt_counts()
+        final_energy = read_battery_energy_uwh()
+        final_charge = read_battery_charge_uah()
         for fd in open_fds:
             try:
                 epoll.unregister(fd)
@@ -1679,7 +1758,12 @@ def main():
         except Exception:
             pass
         if cfg.get("LOG_WAKEUP_SUMMARY", True):
-            log_wakeup_report(sleep_start_ts, initial_soc, initial_irqs, t_end=sleep_end_ts, irqs_end=final_irqs)
+            log_wakeup_report(
+                sleep_start_ts, initial_soc, initial_irqs,
+                t_end=sleep_end_ts, irqs_end=final_irqs,
+                energy_start=initial_energy, charge_start=initial_charge,
+                energy_end=final_energy, charge_end=final_charge
+            )
         log("Wakeup complete, normal power & display restored")
 
     sys.exit(0)
