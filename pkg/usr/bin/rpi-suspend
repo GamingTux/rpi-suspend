@@ -539,17 +539,19 @@ def set_radio_power(radio_type: str, enable: bool):
 
 def set_usb_autosuspend(cfg):
     """Enables standard USB runtime autosuspend on USB audio devices and internal USB 2.0 hubs."""
+    unbound_hids = []
     if cfg.get("SLEEP_CUSTOM_POWER_CUTS", True):
         for hid_id in (cfg.get("CUSTOM_USBHID_UNBIND") or "").split():
             if os.path.exists(f"/sys/bus/usb/drivers/usbhid/{hid_id}"):
                 try:
                     with open("/sys/bus/usb/drivers/usbhid/unbind", "w") as f:
                         f.write(hid_id)
+                    unbound_hids.append(hid_id)
                 except Exception:
                     pass
 
     if not cfg.get("SLEEP_USB_AUTOSUSPEND", True):
-        return
+        return unbound_hids
 
     for audio_intf in glob.glob("/sys/bus/usb/drivers/snd-usb-audio/*:*"):
         try:
@@ -583,6 +585,19 @@ def set_usb_autosuspend(cfg):
                 f.write("on")
         except Exception:
             pass
+
+    return unbound_hids
+
+
+def restore_usb_autosuspend(cfg, unbound_hids=None):
+    """Restores USB HID devices that were unbound during sleep."""
+    if unbound_hids:
+        for hid_id in unbound_hids:
+            try:
+                with open("/sys/bus/usb/drivers/usbhid/bind", "w") as f:
+                    f.write(hid_id)
+            except Exception:
+                pass
 
 
 def pause_media_players():
@@ -1551,7 +1566,7 @@ def main():
     saved_cpu_state = apply_power_saving(cfg)
 
     # 5. USB, Radio & Fan power savings
-    set_usb_autosuspend(cfg)
+    saved_unbound_hids = set_usb_autosuspend(cfg)
     if cfg.get("SLEEP_WIFI_RFKILL", False) and not saved_wifi_blocked:
         set_radio_power("wifi", False)
     elif cfg.get("SLEEP_WIFI_POWERSAVE", True):
@@ -1749,6 +1764,7 @@ def main():
             set_radio_power("wifi", True)
         elif cfg.get("SLEEP_WIFI_POWERSAVE", True):
             set_wifi_power_save(saved_wifi_powersave)
+        restore_usb_autosuspend(cfg, saved_unbound_hids)
         restore_audio(cfg, saved_audio_mute)
         if cfg.get("SLEEP_RUN_HOOKS", True):
             run_hooks("post")
